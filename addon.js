@@ -132,7 +132,11 @@ const {
   getLanguageName
 } = require('./languages');
 const { alignAndMatch } = require('./lib/syncEngine');
-const { generateCandidatePairs } = require('./lib/sourceSelection');
+const {
+  generateCandidatePairs,
+  rankCandidatesForLanguage
+} = require('./lib/sourceSelection');
+const { getJimakuSubtitle } = require('./lib/animeMetadata');
 const {
   parseStyleCode, applyStyle, buildStyleCode, COLOR_PRESETS, SUB_COLOR_PRESETS, MARKER_OPTIONS
 } = require('./lib/styleRenderer');
@@ -490,8 +494,17 @@ function parseSrt(srtText) {
     if (!Array.isArray(parsed) || parsed.length === 0) return null;
 
     // Filter out ads
+    // Remove embedded ASS override tags (e.g. {\an8}, {\pos(...)})
+    const cleaned = parsed.map(sub => ({
+      ...sub,
+      text: (sub.text || '')
+        .replace(/\{\\[^}]*\}/g, '')
+        .trim()
+    }));
+
+    // Filter out ads
     const adKeywords = ['OpenSubtitles.org', 'OpenSubtitles.com', 'osdb.link', 'Advertise your'];
-    const filtered = parsed.filter(sub => 
+    const filtered = cleaned.filter(sub =>
       !adKeywords.some(keyword => (sub.text || '').includes(keyword))
     );
 
@@ -501,6 +514,141 @@ function parseSrt(srtText) {
     return null;
   }
 }
+
+
+
+function parseAss(assText) {
+  if (!assText || typeof assText !== 'string') return null;
+
+  try {
+    assText = assText
+      .replace(/\r\n/g, '\n')
+      .replace(/\r/g, '\n')
+      .replace(/^\uFEFF/, '');
+
+    const lines = assText.split('\n');
+    const subtitles = [];
+
+    let inEvents = false;
+    let format = [];
+
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+
+      if (/^\[Events\]$/i.test(line)) {
+        inEvents = true;
+        continue;
+      }
+
+      if (/^\[.+\]$/.test(line)) {
+        inEvents = false;
+        continue;
+      }
+
+      if (!inEvents) continue;
+
+      if (/^Format:/i.test(line)) {
+        format = line
+          .slice(line.indexOf(':') + 1)
+          .split(',')
+          .map(field => field.trim().toLowerCase());
+
+        continue;
+      }
+
+      if (!/^Dialogue:/i.test(line) || format.length === 0) {
+        continue;
+      }
+
+      // Split at the first nine commas, preserving commas in Text.
+      const fields = [];
+      let remaining = line.slice(line.indexOf(':') + 1);
+
+      for (let i = 0; i < format.length - 1; i++) {
+        const comma = remaining.indexOf(',');
+        if (comma === -1) break;
+
+        fields.push(remaining.slice(0, comma));
+        remaining = remaining.slice(comma + 1);
+      }
+
+      fields.push(remaining);
+
+      if (fields.length !== format.length) continue;
+
+      const event = Object.fromEntries(
+        format.map((field, index) => [field, fields[index]])
+      );
+
+      const startMs = assTimestampToMs(event.start);
+      const endMs = assTimestampToMs(event.end);
+
+      if (startMs === null || endMs === null || endMs <= startMs) {
+        continue;
+      }
+
+      let text = event.text || '';
+
+      // Ignore ASS vector drawings.
+      if (/\\p[1-9]\d*/i.test(text)) continue;
+
+      text = text
+        .replace(/\{[^}]*\}/g, '')
+        .replace(/\\[Nn]/g, ' ')
+        .replace(/\\h/g, ' ')
+        .trim();
+
+      if (!text) continue;
+
+      subtitles.push({
+        id: String(subtitles.length + 1),
+        startTime: msToSrtTime(startMs),
+        endTime: msToSrtTime(endMs),
+        text
+      });
+    }
+
+    subtitles.sort((a, b) =>
+        parseTimeToMs(a.startTime) - parseTimeToMs(b.startTime)
+    );
+
+    return subtitles.length ? subtitles : null;
+  } catch (error) {
+    debugServer.error('Error parsing ASS:', sanitizeForLogging(error.message));
+    return null;
+  }
+}
+
+function assTimestampToMs(timestamp) {
+  if (typeof timestamp !== 'string') return null;
+
+  const match = timestamp.match(/^(\d+):(\d{2}):(\d{2})\.(\d{2})$/);
+
+  if (!match) return null;
+
+  const [, hours, minutes, seconds, centiseconds] = match;
+
+  return (
+    Number(hours) * 3600000 +
+    Number(minutes) * 60000 +
+    Number(seconds) * 1000 +
+    Number(centiseconds) * 10
+  );
+}
+
+
+
+function parseSubtitleContent(content, filename = '') {
+  const extension = filename.split('.').pop().toLowerCase();
+
+  if (extension === 'ass' || extension === 'ssa') {
+    return parseAss(content);
+  }
+
+  return parseSrt(content);
+}
+
+
 
 /**
  * Convert milliseconds to SRT time format.
@@ -713,6 +861,119 @@ async function getSubtitle(key) {
 }
 
 /**
+ * Download and parse a Jimaku subtitle using the server-side API token.
+ */
+async function fetchJimakuSubtitleContent(file) {
+  const token = process.env.JIMAKU_API_TOKEN;
+
+  if (!token || !file?.url) return null;
+
+  try {
+    const response = await fetch(file.url, {
+      headers: { Authorization: token },
+      signal: AbortSignal.timeout(15000)
+    });
+
+    if (!response.ok) {
+      throw new Error(`Jimaku download returned HTTP ${response.status}`);
+    }
+
+    const contentLength = Number(response.headers.get('content-length'));
+    if (contentLength > 5 * 1024 * 1024) {
+      throw new Error('Jimaku subtitle exceeds 5MB limit');
+    }
+
+    const buffer = Buffer.from(await response.arrayBuffer());
+
+    if (buffer.length === 0 || buffer.length > 5 * 1024 * 1024) {
+      throw new Error('Invalid Jimaku subtitle size');
+    }
+
+    const content = decodeSubtitleBuffer(buffer, 'jpn');
+    return parseSubtitleContent(content, file.name);
+  } catch (error) {
+    debugServer.error(
+      'Error downloading Jimaku subtitle:',
+      sanitizeForLogging(error.message)
+    );
+    return null;
+  }
+}
+
+/**
+ * Merge one Jimaku Japanese subtitle with ranked OpenSubtitles translations.
+ */
+async function selectAndMergeJimakuPair(
+  jimakuFile,
+  translationCandidates,
+  transLang,
+  styleCfg = null
+) {
+  if (!Array.isArray(translationCandidates) ||
+      translationCandidates.length === 0) return null;
+
+  const mainParsed = await fetchJimakuSubtitleContent(jimakuFile);
+
+  if (!mainParsed || mainParsed.length === 0) {
+    debugServer.warn('Jimaku subtitle could not be parsed');
+    return null;
+  }
+
+  let best = null;
+  const attempts = Math.min(
+    translationCandidates.length,
+    MAX_PAIR_ATTEMPTS
+  );
+
+  for (let i = 0; i < attempts; i++) {
+    const transSub = translationCandidates[i];
+
+    debugServer.log(
+      `Jimaku merge attempt ${i + 1}/${attempts}: trans=${transSub.id}`
+    );
+
+    const content = await fetchSubtitleContent(transSub.url, transLang);
+    const transParsed = content ? parseSrt(content) : null;
+
+    if (!transParsed || transParsed.length === 0) {
+      debugServer.warn(`Translation subtitle ${transSub.id} could not be parsed`);
+      continue;
+    }
+
+    const merged = mergeSubtitles(mainParsed, transParsed, {
+      mainLang: 'jpn',
+      transLang,
+      style: styleCfg
+    });
+
+    const matchRate = merged?.matchRate ?? 0;
+
+    debugServer.log(
+      `Jimaku merge match rate: ${(matchRate * 100).toFixed(1)}%`
+    );
+
+    if (!best || matchRate > best.matchRate) {
+      best = {
+        merged,
+        mergedSrt: merged?.length > 0 ? formatSrt(merged) : null,
+        matchRate,
+        mainSub: { id: 'jimaku', name: jimakuFile.name },
+        transSub,
+        attempts: i + 1,
+        passedGate: matchRate >= QUALITY_GATE_THRESHOLD
+      };
+    }
+
+    if (matchRate >= QUALITY_GATE_THRESHOLD) {
+      debugServer.log('Jimaku pair passed quality gate');
+      break;
+    }
+  }
+
+  return best;
+}
+
+/**
  * Try candidate (main, trans) pairs in order. For each pair, fetch both
  * subtitle files, parse them, and run mergeSubtitles. The first pair whose
  * match rate clears QUALITY_GATE_THRESHOLD wins; otherwise we return the
@@ -850,14 +1111,95 @@ async function subtitlesHandler({ type, id, extra, config }) {
 
     // Fetch all subtitles
     debugServer.log('Fetching subtitles from OpenSubtitles...');
-    const allSubtitles = await fetchAllSubtitles(imdbId, type, season, episode, videoParams);
+    const fetchedSubtitles = await fetchAllSubtitles(
+      imdbId, type, season, episode, videoParams
+    );
+    const allSubtitles = Array.isArray(fetchedSubtitles)
+      ? fetchedSubtitles
+      : [];
 
-    if (!allSubtitles) {
-      debugServer.warn('No subtitles found');
-      return { subtitles: [] };
+    if (allSubtitles.length === 0) {
+      debugServer.warn('No OpenSubtitles results; checking Jimaku');
+    } else {
+      debugServer.log(`Found ${allSubtitles.length} total subtitles`);
     }
 
-    debugServer.log(`Found ${allSubtitles.length} total subtitles`);
+    // Japanese primary language: prefer Jimaku for the learning track.
+    if (mainLang === 'jpn' && type === 'series' && season && episode) {
+      const jimakuFile = await getJimakuSubtitle(imdbId, season, episode, extra?.filename);
+      const translations = rankCandidatesForLanguage(allSubtitles, transLang);
+
+      if (jimakuFile && translations.length === 0) {
+        const dynamicParams = [
+          type,
+          imdbId,
+          season || '0',
+          episode || '0',
+          mainLang,
+          transLang,
+          'jimaku-only',
+          'none'
+        ].join('/');
+
+        const queryParts = [];
+        if (videoQuery) queryParts.push(videoQuery);
+        queryParts.push(`style=${encodeURIComponent(styleCode)}`);
+
+        debugServer.log(
+          `Selected Japanese-only Jimaku subtitle "${jimakuFile.name}"`
+        );
+
+        return {
+          subtitles: [{
+            id: `jimaku-only-${jimakuFile.entryId}-${episode}`,
+            url: `{{ADDON_URL}}/subs/${dynamicParams}.srt?${queryParts.join('&')}`,
+            lang: 'jpn',
+            SubtitlesName: 'Japanese (Jimaku)'
+          }],
+          cacheMaxAge: 6 * 3600
+        };
+      }
+
+      if (jimakuFile && translations.length > 0) {
+        const bestTranslation = translations[0];
+
+        const dynamicParams = [
+          type,
+          imdbId,
+          season || '0',
+          episode || '0',
+          mainLang,
+          transLang,
+          'jimaku',
+          bestTranslation.id
+        ].join('/');
+
+        const queryParts = [];
+        if (videoQuery) queryParts.push(videoQuery);
+        queryParts.push(`style=${encodeURIComponent(styleCode)}`);
+
+        debugServer.log(
+          `Selected Jimaku subtitle "${jimakuFile.name}" ` +
+          `with translation ${bestTranslation.id}`
+        );
+
+        return {
+          subtitles: [{
+            id: `dual-jimaku-${bestTranslation.id}`,
+            url: `{{ADDON_URL}}/subs/${dynamicParams}.srt?${queryParts.join('&')}`,
+            lang: mainLang,
+            SubtitlesName:
+              `Dual (JPN+${transLang.toUpperCase()}) - ` +
+              `${getLanguageName(mainLang)} + ${getLanguageName(transLang)}`
+          }],
+          cacheMaxAge: 6 * 3600
+        };
+      }
+
+      debugServer.log(
+        'No usable Jimaku subtitle/translation found; using OpenSubtitles fallback'
+      );
+    }
 
     // Build the ordered list of (main, trans) candidates. Same-`g`
     // (same release) pairs come first; this is our biggest single
@@ -961,64 +1303,151 @@ async function generateDynamicSubtitle(
   }
 
   try {
-    // Fetch all subtitles
     const normalizedVideoParams = normalizeVideoParams(videoParams);
+    const styleCfg = styleCode == null ? null : parseStyleCode(styleCode);
+
+    // Japanese-only Jimaku path: no OpenSubtitles request or merging needed.
+    if (mainSubId === 'jimaku-only' && mainLang === 'jpn') {
+      const jimakuFile = await getJimakuSubtitle(
+        imdbId,
+        season !== '0' ? season : null,
+        episode !== '0' ? episode : null,
+        videoParams?.filename
+      );
+
+      if (!jimakuFile) {
+        debugServer.warn('Japanese-only Jimaku subtitle not found');
+        return null;
+      }
+
+      const parsed = await fetchJimakuSubtitleContent(jimakuFile);
+      if (!parsed || parsed.length === 0) {
+        debugServer.warn('Japanese-only Jimaku subtitle could not be parsed');
+        return null;
+      }
+
+      const styled = parsed.map(sub => ({
+        ...sub,
+        text: applyStyle(htmlEncodeSrt(sub.text), '', styleCfg)
+      })).filter(sub => sub.text);
+
+      const srtContent = formatSrt(styled);
+      if (!srtContent) return null;
+
+      storeSubtitle(cacheKey, srtContent);
+      debugServer.log(
+        `Generated Japanese-only Jimaku subtitle (${styled.length} cues)`
+      );
+      return srtContent;
+    }
+
+    // Fetch OpenSubtitles for dual-track generation.
     const allSubtitles = await fetchAllSubtitles(
-      imdbId, 
-      type, 
-      season !== '0' ? season : null, 
+      imdbId,
+      type,
+      season !== '0' ? season : null,
       episode !== '0' ? episode : null,
       normalizedVideoParams
     );
 
-    if (!allSubtitles) {
+    if (!Array.isArray(allSubtitles) || allSubtitles.length === 0) {
       debugServer.warn('No subtitles found');
       return null;
     }
 
-    // Build candidate pairs for this title; we'll start by trying the
-    // exact pair encoded in the URL (the one subtitlesHandler picked),
-    // then fall back to other candidates if the match rate is too low.
-    const candidatePairs = generateCandidatePairs(allSubtitles, mainLang, transLang);
+    let best = null;
 
-    const requestedMain = allSubtitles.find(s => String(s.id) === String(mainSubId));
-    const requestedTrans = allSubtitles.find(s => String(s.id) === String(transSubId));
-
-    let orderedPairs = candidatePairs;
-    if (requestedMain && requestedTrans) {
-      // Move the URL-requested pair to the front (or insert it if it
-      // wasn't in the candidate list, e.g. addon was upgraded mid-cache).
-      const isSameGroup =
-        requestedMain.g === requestedTrans.g && requestedMain.g != null;
-      const head = {
-        main: requestedMain,
-        trans: requestedTrans,
-        sameGroup: isSameGroup,
-        group: isSameGroup ? requestedMain.g : null,
-        source: 'requested'
-      };
-      orderedPairs = [
-        head,
-        ...candidatePairs.filter(
-          p => !(String(p.main.id) === String(mainSubId) &&
-                 String(p.trans.id) === String(transSubId))
-        )
-      ];
-    } else {
-      debugServer.warn(
-        'Requested specific pair not present in fresh subtitle list; ' +
-        'falling back to ranked candidates'
+    // A reserved main track ID indicates that the primary subtitle is Jimaku.
+    if (mainSubId === 'jimaku' && mainLang === 'jpn') {
+      const jimakuFile = await getJimakuSubtitle(
+        imdbId,
+        season !== '0' ? season : null,
+        episode !== '0' ? episode : null,
+        videoParams?.filename
       );
+
+      if (jimakuFile) {
+        const translations = rankCandidatesForLanguage(allSubtitles, transLang);
+        const requestedTrans = translations.find(
+          sub => String(sub.id) === String(transSubId)
+        );
+
+        const orderedTranslations = requestedTrans
+          ? [
+              requestedTrans,
+              ...translations.filter(
+                sub => String(sub.id) !== String(transSubId)
+              )
+            ]
+          : translations;
+
+        best = await selectAndMergeJimakuPair(
+          jimakuFile,
+          orderedTranslations,
+          transLang,
+          styleCfg
+        );
+      }
+
+      if (!best) {
+        debugServer.warn(
+          'Jimaku generation failed; falling back to OpenSubtitles pairs'
+        );
+      }
     }
 
-    if (orderedPairs.length === 0) return null;
+    // Existing OpenSubtitles path, also used as the Jimaku fallback.
+    if (!best) {
+      const candidatePairs = generateCandidatePairs(
+        allSubtitles,
+        mainLang,
+        transLang
+      );
 
-    const best = await selectAndMergeBestPair(
-      orderedPairs,
-      mainLang,
-      transLang,
-      styleCode == null ? null : parseStyleCode(styleCode)
-    );
+      const requestedMain = allSubtitles.find(
+        s => String(s.id) === String(mainSubId)
+      );
+      const requestedTrans = allSubtitles.find(
+        s => String(s.id) === String(transSubId)
+      );
+
+      let orderedPairs = candidatePairs;
+
+      if (requestedMain && requestedTrans) {
+        const isSameGroup =
+          requestedMain.g === requestedTrans.g && requestedMain.g != null;
+
+        const head = {
+          main: requestedMain,
+          trans: requestedTrans,
+          sameGroup: isSameGroup,
+          group: isSameGroup ? requestedMain.g : null,
+          source: 'requested'
+        };
+
+        orderedPairs = [
+          head,
+          ...candidatePairs.filter(
+            p => !(String(p.main.id) === String(mainSubId) &&
+                   String(p.trans.id) === String(transSubId))
+          )
+        ];
+      } else {
+        debugServer.warn(
+          'Requested specific pair not present in fresh subtitle list; ' +
+          'falling back to ranked candidates'
+        );
+      }
+
+      if (orderedPairs.length > 0) {
+        best = await selectAndMergeBestPair(
+          orderedPairs,
+          mainLang,
+          transLang,
+          styleCfg
+        );
+      }
+    }
     if (!best || !best.merged || best.merged.length === 0) {
       debugServer.warn('No usable merged subtitle from any pair');
       return null;
@@ -1055,6 +1484,11 @@ module.exports = {
     joinSubtitleLines,
     formatSrt,
     formatSrtSimple,
-    msToSrtTime
+    msToSrtTime,
+    parseAss,
+    assTimestampToMs,
+    parseSubtitleContent,
+    fetchAllSubtitles,
+    fetchSubtitleContent,
   }
 };
